@@ -34,23 +34,34 @@ ENV DEBIAN_FRONTEND=noninteractive \
 ENV PATH="${PATH}:/usr/local/nvidia/bin" \
     LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
 
-# Replace Ubuntu sources if specified
-RUN if [ -n "$UBUNTU_MIRROR" ]; then \
-    sed -i "s|http://.*archive.ubuntu.com|$UBUNTU_MIRROR|g" /etc/apt/sources.list && \
-    sed -i "s|http://.*security.ubuntu.com|$UBUNTU_MIRROR|g" /etc/apt/sources.list; \
-fi
+# Make apt more tolerant of transient mirror/network failures. Ubuntu 24.04
+# images may use deb822 .sources files instead of /etc/apt/sources.list.
+RUN printf '%s\n' \
+        'Acquire::Retries "5";' \
+        'Acquire::http::Timeout "30";' \
+        'Acquire::https::Timeout "30";' \
+        > /etc/apt/apt.conf.d/80-retries \
+    && if [ -n "$UBUNTU_MIRROR" ]; then \
+        find /etc/apt -type f \( -name "*.list" -o -name "*.sources" \) -print0 \
+            | xargs -0 sed -i \
+                -e "s|http://archive.ubuntu.com/ubuntu|$UBUNTU_MIRROR|g" \
+                -e "s|http://security.ubuntu.com/ubuntu|$UBUNTU_MIRROR|g"; \
+    fi
 
 # Python setup (combined with apt update to reduce layers)
 # Ubuntu 24.04 ships Python 3.12 in main, so we no longer need the deadsnakes
+
 # PPA. Dropping it avoids transient Launchpad 504s in `add-apt-repository`.
+
+COPY docker/local-files/get-pip.py /tmp/get-pip.py
+
 RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
     apt update && apt install -y --no-install-recommends wget software-properties-common \
     && apt install -y --no-install-recommends python3.12-full python3.12-dev \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 2 \
     && update-alternatives --set python3 /usr/bin/python3.12 \
-    && wget -q https://bootstrap.pypa.io/get-pip.py \
-    && python3 get-pip.py --break-system-packages \
-    && rm get-pip.py \
+    && python3 /tmp/get-pip.py --break-system-packages \
+    && rm /tmp/get-pip.py \
     # Allow pip to install packages globally (PEP 668 workaround for Ubuntu 24.04)
     && python3 -m pip config set global.break-system-packages true \
     # Fix for apt-add-repository
@@ -77,7 +88,7 @@ RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
     perl \
     patchelf \
     ccache \
-    git-lfs \
+    git \
     # MPI and NUMA
     libopenmpi-dev \
     libnuma1 \
@@ -139,8 +150,8 @@ RUN mkdir -p /tmp/gdrcopy && cd /tmp \
         https://${GITHUB_ARTIFACTORY}/NVIDIA/gdrcopy/archive/refs/tags/v${GDRCOPY_VERSION}.tar.gz \
     && tar -xzf v${GDRCOPY_VERSION}.tar.gz && rm v${GDRCOPY_VERSION}.tar.gz \
     && cd gdrcopy-${GDRCOPY_VERSION}/packages \
-    && CUDA=/usr/local/cuda ./build-deb-packages.sh \
-    && dpkg -i gdrdrv-dkms_*.deb libgdrapi_*.deb gdrcopy-tests_*.deb gdrcopy_*.deb \
+    && CUDA=/usr/local/cuda ./build-deb-packages.sh -t \
+    && dpkg -i gdrdrv-dkms_*.deb libgdrapi_*.deb \
     && cd / && rm -rf /tmp/gdrcopy
 
 # Fix DeepEP IBGDA symlink
@@ -547,14 +558,14 @@ RUN --mount=type=cache,target=/root/.cache/pip if [ "${CUDA_VERSION%%.*}" = "12"
     python3 -m pip install cuda-python==12.9 ; \
     cd /sgl-workspace && git clone https://github.com/deepseek-ai/FlashMLA.git flash-mla \
     && cd flash-mla && git submodule update --init --recursive \
-    && pip install --no-build-isolation -v . ; \
+    && MAX_JOBS=${BUILD_AND_DOWNLOAD_PARALLEL} CMAKE_BUILD_PARALLEL_LEVEL=${BUILD_AND_DOWNLOAD_PARALLEL} pip install --no-build-isolation -v . ; \
 elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
     python3 -m pip install nixl nixl-cu13 --no-deps ; \
     python3 -m pip install cuda-python==13.2.0 ; \
     cd /sgl-workspace && git clone https://github.com/deepseek-ai/FlashMLA.git flash-mla \
     && ln -s /usr/local/cuda/include/cccl/cuda /usr/local/cuda/include/cuda \
     && cd flash-mla && git submodule update --init --recursive \
-    && pip install --no-build-isolation -v . ; \
+    && MAX_JOBS=${BUILD_AND_DOWNLOAD_PARALLEL} CMAKE_BUILD_PARALLEL_LEVEL=${BUILD_AND_DOWNLOAD_PARALLEL} pip install --no-build-isolation -v . ; \
 fi
 
 # Add yank script

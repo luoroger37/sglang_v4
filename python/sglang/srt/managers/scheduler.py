@@ -1836,8 +1836,13 @@ class Scheduler(
             if is_health_check_generate_req(recv_req) and not self.is_fully_idle(
                 for_health_check=True
             ):
-                self.return_health_check_ipcs.append(
-                    getattr(recv_req, "http_worker_ipc", None)
+                # Return immediately instead of piggybacking on a future batch
+                # result. A "busy" disagg decode path may be unable to produce
+                # output, which would make health checks time out repeatedly.
+                self.send_to_tokenizer.send_output(
+                    HealthCheckOutput(
+                        http_worker_ipc=getattr(recv_req, "http_worker_ipc", None)
+                    )
                 )
                 continue
 
