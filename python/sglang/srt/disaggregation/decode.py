@@ -369,10 +369,7 @@ class DecodePreallocQueue:
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
-        # HiSparse Host pool has page_size=1; use it for direct-to-host mode.
-        kv_args.page_size = (
-            1 if self.scheduler.enable_hisparse else self.token_to_kv_pool.page_size
-        )
+        kv_args.page_size = self.token_to_kv_pool.page_size
 
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
             self.metadata_buffers.get_buf_infos()
@@ -801,6 +798,7 @@ class DecodePreallocQueue:
             )
             decode_req.req.cache_protected_len = prefix_len
 
+            page_size = self.token_to_kv_pool_allocator.page_size
             if self.scheduler.enable_hisparse:
                 # Must cast to int32 for ZMQ serialization -- from_zmq reads np.int32.
                 kv_indices = (
@@ -809,9 +807,11 @@ class DecodePreallocQueue:
                     .numpy()
                     .astype(np.int32)
                 )
-                page_size = 1  # host pool page_size
                 device_kv_page_indices = None
                 if isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
+                    # DSV4 host C4 entries are token-linear, while non-sparse KV
+                    # still uses device page indices.
+                    page_size = 1
                     kv_indices_full = self.req_to_token_pool.req_to_token[
                         decode_req.req.req_pool_idx, prefix_len:origin_input_len
                     ]
@@ -828,7 +828,6 @@ class DecodePreallocQueue:
                     .cpu()
                     .numpy()
                 )
-                page_size = self.token_to_kv_pool_allocator.page_size
                 device_kv_page_indices = None
 
             # Prepare extra pool indices for hybrid models
@@ -1089,18 +1088,12 @@ class DecodePreallocQueue:
             # Allocate host indices for the RDMA transfer target. DeepSeek V4
             # stores HiSparse host KV at c4-token granularity.
             host_len = (
-                fill_len // coordinator.compress_ratio
+                (fill_len + coordinator.compress_ratio - 1)
+                // coordinator.compress_ratio
                 if coordinator.is_dsv4_hisparse
                 else fill_len
             )
-            host_indices = coordinator.mem_pool_host.alloc(host_len)
-            if host_indices is None:
-                raise RuntimeError(
-                    f"HiSparse host mem pool alloc failed for {host_len} tokens "
-                    f"in _pre_alloc (req {req.rid})"
-                )
-            host_indices = host_indices.to(device=coordinator.device)
-            coordinator.req_to_host_pool[req.req_pool_idx, :host_len] = host_indices
+            host_indices = coordinator.ensure_host_slots(req.req_pool_idx, 0, host_len)
         elif self.token_to_kv_pool_allocator.page_size == 1:
             kv_loc = self.token_to_kv_pool_allocator.alloc(delta_len)
         else:
